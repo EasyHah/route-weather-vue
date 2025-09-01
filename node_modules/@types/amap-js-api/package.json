@@ -1,0 +1,26 @@
+{
+    "name": "@types/amap-js-api",
+    "version": "1.4.16",
+    "description": "TypeScript definitions for amap-js-api",
+    "homepage": "https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/amap-js-api",
+    "license": "MIT",
+    "contributors": [
+        {
+            "name": "breeze9527",
+            "githubUsername": "breeze9527",
+            "url": "https://github.com/breeze9527"
+        }
+    ],
+    "main": "",
+    "types": "index.d.ts",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/DefinitelyTyped/DefinitelyTyped.git",
+        "directory": "types/amap-js-api"
+    },
+    "scripts": {},
+    "dependencies": {},
+    "typesPublisherContentHash": "1afc095fc41d6d7a84f3af2ee64f499481371dac5f3727e02c327d8db95cdeb5",
+    "typeScriptVersion": "4.5",
+    "nonNpm": true
+}

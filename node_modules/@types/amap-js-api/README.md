@@ -1,0 +1,15 @@
+# Installation
+> `npm install --save @types/amap-js-api`
+
+# Summary
+This package contains type definitions for amap-js-api (https://lbs.amap.com/api/javascript-api/summary).
+
+# Details
+Files were exported from https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/amap-js-api.
+
+### Additional Details
+ * Last updated: Mon, 06 Nov 2023 22:41:04 GMT
+ * Dependencies: none
+
+# Credits
+These definitions were written by [breeze9527](https://github.com/breeze9527).
