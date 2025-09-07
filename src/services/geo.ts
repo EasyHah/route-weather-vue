@@ -73,3 +73,4 @@ export function groupByProvince(
   }
   return segments;
 }
+

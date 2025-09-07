@@ -18,6 +18,12 @@
     "types": [
       "vite/client"
     ],
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+
+    /* Added for amap-js-api types */
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
     "baseUrl": ".",
     "paths": {
       "@/*": [
