@@ -5,7 +5,14 @@ export function loadAmap(apiKey: string): Promise<void> {
     (window as any)._AMapSecurityConfig = scode ? { securityJsCode: scode } : undefined;
     const s = document.createElement('script');
     s.src = `https://webapi.amap.com/maps?v=2.0&key=${apiKey}&plugin=` +
-            ['AMap.Geocoder','AMap.GeoJSON' ,'AMap.Driving','AMap.AutoComplete','AMap.DistrictSearch','AMap.GeometryUtil','AMap.DistrictLayer'].join(',');
+            ['AMap.Geocoder',
+              'AMap.GeoJSON' ,
+              'AMap.Driving',
+              'AMap.AutoComplete',
+              'AMap.DistrictSearch',
+              'AMap.GeometryUtil',
+              'AMap.DistrictLayer'
+            ].join(',');
     s.onload = () => resolve();
     s.onerror = (e) => reject(e);
     document.head.appendChild(s);

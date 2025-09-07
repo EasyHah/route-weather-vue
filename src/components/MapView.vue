@@ -27,16 +27,16 @@
 
 <script setup lang="ts">
 /**
- * Make sure your loader includes:
- * AMap.Driving, AMap.AutoComplete, AMap.DistrictSearch, AMap.DistrictLayer,
- * AMap.GeometryUtil, AMap.Geocoder, AMap.MarkerClusterer (optional)
+ * 需要的插件（请在 src/services/amap.ts 的 loader 中确保包含）：
+ *  AMap.Driving, AMap.Geocoder, AMap.DistrictSearch, AMap.GeometryUtil,
+ *  AMap.DistrictLayer, AMap.MarkerClusterer
  */
 import { onMounted, ref, watch, nextTick, reactive } from 'vue'
 import Controls from './Controls.vue'
 import Legend from './Legend.vue'
 import { loadAmap, planDriving } from '@/services/amap'
 import { fetchProvinceList, type ProvinceInfo } from '@/services/district'
-import { fetchWeatherForCoord } from '@/services/weather'
+import { fetchWeatherForCoord, fetchHourly24h } from '@/services/weather'
 import { makeLinearScale } from '@/services/choropleth'
 
 const props = defineProps<{ planTrigger: { from: string; to: string; stepKm: number } | null }>()
@@ -58,7 +58,10 @@ const layers = reactive({
 
 /* --------------------------- Admin rendering ------------------------------ */
 let provinceLayer: any = null
+let provincePolygons: any[] = []                // fallback GeoJSON 多边形
 const activeProvinceAdcode = ref<string | null>(null)
+let provincePropsByGb = new Map<string, {name:string;adcode:string;center:[number,number]}>()
+let hoverInfo: any = null
 
 /* ------------------------------ UI / legend ------------------------------ */
 const ui = ref({ metric: 'temp', showChoropleth: true })
@@ -70,6 +73,8 @@ const legendMin = ref('低'); const legendMax = ref('高')
 let allProvinces: ProvinceInfo[] = []
 let passedProvinces: ProvinceInfo[] = []
 let colorByAdcode: Record<string, string> = {}
+let colorValuesByAdcode: Record<string, number> = {}
+let currentUnit = ''
 
 type CityInfo = { name: string; adcode: string; center?: [number, number] }
 
@@ -79,20 +84,23 @@ const geocodeCache = new Map<string, { province: string; provinceAdcode: string;
 /* --------------------- Route / sample / cities layers --------------------- */
 let routePolyline: any | null = null
 let sampleDots: any[] = []
-let lastSamples: [number,number][] = []       // <- keep latest samples so toggle “采样点”后能生成
+let lastSamples: [number,number][] = []       // toggle “采样点”时使用
 let cityMarkers: any[] = []
 let cityCluster: any | null = null
 let lastCities: { name:string; adcode:string }[] = []
 
 /* -------------------------------- Helpers -------------------------------- */
 function assertAmapPlugins() {
-  const missing: string[] = []
-  if (!AMapRef?.DistrictLayer?.Province) missing.push('AMap.DistrictLayer')
-  if (!AMapRef?.DistrictSearch) missing.push('AMap.DistrictSearch')
-  if (!AMapRef?.GeometryUtil)  missing.push('AMap.GeometryUtil')
-  if (!AMapRef?.Driving)       missing.push('AMap.Driving')
-  if (!AMapRef?.Geocoder)      missing.push('AMap.Geocoder')
-  if (missing.length) console.error('[AMap] Missing plugins:', missing.join(', '))
+  const needed = [
+    ['DistrictLayer','AMap.DistrictLayer'],
+    ['DistrictSearch','AMap.DistrictSearch'],
+    ['GeometryUtil','AMap.GeometryUtil'],
+    ['Driving','AMap.Driving'],
+    ['Geocoder','AMap.Geocoder'],
+  ] as const
+  const missing = needed.filter(([k]) => !AMapRef?.[k])
+                        .map(([,n]) => n)
+  if (missing.length) console.warn('[AMap] Missing plugins (地图仍可加载，部分功能会降级):', missing.join(', '))
 }
 
 function parseCoord(s: string): [number, number] | null {
@@ -101,14 +109,6 @@ function parseCoord(s: string): [number, number] | null {
 }
 function normPath(path: any[]): [number,number][] {
   return path.map((p: any) => Array.isArray(p) ? [p[0], p[1]] : [p.lng, p.lat])
-}
-function levelForAdcode(adcode: string): 'country'|'province'|'city'|'district' {
-  if (/^\d{6}$/.test(adcode)) {
-    if (adcode.endsWith('0000')) return 'province'
-    if (adcode.endsWith('00'))   return 'city'
-    return 'district'
-  }
-  return 'province'
 }
 
 /** 等距采样：省(更密) / 市(更疏)分别调用 */
@@ -141,7 +141,7 @@ function samplePolyline(path: [number,number][], stepKm = 10): [number,number][]
   return pts
 }
 
-/** Province center KNN prefilter */
+/** Province center KNN 预筛 */
 function sqDistLngLat(a:[number,number], b:[number,number]) {
   const kx = Math.cos(((a[1]+b[1])/2) * Math.PI/180) * 111320
   const ky = 110540
@@ -156,6 +156,7 @@ function kNearestProvinces(pt:[number,number], k=6): ProvinceInfo[] {
 /* --------------------------- DS / boundary helpers ------------------------ */
 function dsSearchWithTimeout(opts: any, query: string, ms = 12000) {
   return new Promise<any>((resolve, reject) => {
+    if (!AMapRef?.DistrictSearch) return resolve(null) // 降级
     const ds = new AMapRef.DistrictSearch(opts)
     const t = setTimeout(() => reject(new Error(`DistrictSearch timeout: ${JSON.stringify(opts)} ${query}`)), ms)
     ds.search(query, (status: string, res: any) => {
@@ -183,11 +184,11 @@ function pointInAnyBoundary(pt: [number,number], boundaries: [number,number][][]
 }
 function getBoundaryRings(adcode: string): Promise<[number,number][][]> {
   if (boundaryCache.has(adcode)) return boundaryCache.get(adcode)!
-  const first = levelForAdcode(adcode)
-  const tryLevels: Array<'province'|'city'|'district'> =
-    Array.from(new Set([first as any, 'province', 'city', 'district']))
+  // 多层级尝试
+  const tryLevels: Array<'province'|'city'|'district'> = ['province','city','district']
 
   const task = (async () => {
+    if (!AMapRef?.DistrictSearch) throw new Error('DistrictSearch not available')
     let lastErr: unknown = null
     for (const lv of tryLevels) {
       try {
@@ -209,11 +210,12 @@ function getBoundaryRings(adcode: string): Promise<[number,number][][]> {
 }
 
 /* ----------------------------- Geocoder helpers --------------------------- */
-function ensureGeocoder() { if (!geocoder) geocoder = new AMapRef.Geocoder({ extensions: 'all' }) }
+function ensureGeocoder() { if (!geocoder && AMapRef?.Geocoder) geocoder = new AMapRef.Geocoder({ extensions: 'all' }) }
 function keyForLngLat(lnglat:[number,number]) { return `${lnglat[0].toFixed(4)},${lnglat[1].toFixed(4)}` } // ~11m grid
 
-async function reverseGeocodeProvinceCity(lnglat:[number,number]): Promise<{ province: string; provinceAdcode: string; city: string; cityAdcode: string }> {
+async function reverseGeocodeProvinceCity(lnglat:[number,number]): Promise<{ province: string; provinceAdcode: string; city: string; cityAdcode: string } | null> {
   ensureGeocoder()
+  if (!geocoder) return null
   const k = keyForLngLat(lnglat)
   if (geocodeCache.has(k)) return geocodeCache.get(k)!
   const res = await new Promise<any>((resolve, reject) => {
@@ -246,8 +248,8 @@ async function ensureProvinceList() {
 
 async function provincesAlongRouteAccurate(path: [number,number][]) {
   await ensureProvinceList()
-  const samplesProv = samplePolyline(path, 8) // dense for accuracy
-  lastSamples = samplesProv.slice()           // 保存以便“采样点”开关可用
+  const samplesProv = samplePolyline(path, 8) // dense
+  lastSamples = samplesProv.slice()
 
   const result: ProvinceInfo[] = []
   const seen = new Set<string>()
@@ -306,7 +308,7 @@ async function citiesAlongRouteFast(path:[number,number][]) {
   for (const p of samplesCity) {
     try {
       const g = await reverseGeocodeProvinceCity(p)
-      if (!g.cityAdcode || seen.has(g.cityAdcode)) continue
+      if (!g?.cityAdcode || seen.has(g.cityAdcode)) continue
       seen.add(g.cityAdcode)
       out.push({ name: g.city, adcode: g.cityAdcode })
     } catch {}
@@ -316,46 +318,108 @@ async function citiesAlongRouteFast(path:[number,number][]) {
 
 /* ---------------------- DistrictLayer.Province rendering ------------------ */
 function ensureProvinceLayer() {
+  // 清理旧图层
   if (provinceLayer) { provinceLayer.setMap(null); provinceLayer = null }
-  provinceLayer = new AMapRef.DistrictLayer.Province({
-    adcode: ['100000'],
-    depth: 1,
-    zIndex: 40,
-    styles: {
-      'fill': () => layers.showProvinceFill ? 'rgba(0,0,0,0.03)' : 'rgba(0,0,0,0.03)',
-      'province-stroke': layers.showProvinceBorders ? '#e60000' : 'transparent',
-      'city-stroke': 'transparent',
-      'county-stroke': 'transparent'
-    }
-  })
-  provinceLayer.setMap(map)
+  provincePolygons.forEach(p => p.setMap(null)); provincePolygons = [];
 
-  // hover highlight
-  provinceLayer.on('mouseover', (e: any) => {
-    activeProvinceAdcode.value = e.feature?.properties?.adcode || null
-    recolorProvinceLayer()
-  })
-  provinceLayer.on('mouseout', () => {
-    activeProvinceAdcode.value = null
-    recolorProvinceLayer()
-  })
+  // 共享悬浮窗
+  if (!hoverInfo && AMapRef?.InfoWindow) {
+    hoverInfo = new AMapRef.InfoWindow({ isCustom:false, offset: new AMapRef.Pixel(0,-10), anchor:'bottom-center' });
+  }
+
+  // 优先 DistrictLayer
+  try {
+    if (AMapRef?.DistrictLayer?.Province) {
+      provinceLayer = new AMapRef.DistrictLayer.Province({
+        adcode: ['100000'],
+        depth: 1,
+        zIndex: 40,
+        styles: {
+          'fill': (props:any) => computeFill(props.adcode),
+          'province-stroke': layers.showProvinceBorders ? '#e60000' : 'transparent',
+          'city-stroke': 'transparent',
+          'county-stroke': 'transparent'
+        }
+      });
+      provinceLayer.setMap(map);
+      provinceLayer.on('mouseover', (e: any) => {
+        activeProvinceAdcode.value = e.feature?.properties?.adcode || null;
+        showHover(e.lnglat, e.feature?.properties?.name, activeProvinceAdcode.value || undefined);
+        recolorProvinceLayer();
+      });
+      provinceLayer.on('mouseout', () => {
+        activeProvinceAdcode.value = null;
+        hoverInfo?.close?.();
+        recolorProvinceLayer();
+      });
+      return;
+    }
+  } catch {}
+
+  // Fallback: /public/provinces.geojson
+  renderProvinceFallbackFromGeoJSON();
 }
-function recolorProvinceLayer() {
-  if (!provinceLayer) return
-  provinceLayer.setStyles({
-    'fill': (props: any) => {
-      const ad = props.adcode
-      if (!layers.showProvinceFill) return 'rgba(0,0,0,0.03)'
-      if (ui.value.showChoropleth && colorByAdcode[ad]) return colorByAdcode[ad]
-      if (activeProvinceAdcode.value && ad === activeProvinceAdcode.value) return 'rgba(255,160,0,0.35)'
-      return 'rgba(0,0,0,0.05)'
-    },
-    'province-stroke': layers.showProvinceBorders ? '#e60000' : 'transparent',
-    'city-stroke': 'transparent',
-    'county-stroke': 'transparent'
-  })
-  // 强制一次刷新，避免偶发样式不生效
-  provinceLayer.setMap(null); provinceLayer.setMap(map)
+
+async function renderProvinceFallbackFromGeoJSON() {
+  try {
+    const resp = await fetch('/provinces.geojson');
+    const gj = await resp.json();
+    provincePropsByGb.clear();
+
+    for (const f of gj.features) {
+      const name = f.properties?.name || '';
+      const gb = String(f.properties?.gb || '');
+      if (!gb || name === '境界线') continue;
+      const adcode = gb.startsWith('156') ? gb.slice(3) : gb;
+      const geom = f.geometry;
+
+      const paths: any[] = [];
+      if (geom.type === 'MultiPolygon') {
+        for (const poly of geom.coordinates) for (const ring of poly) paths.push(ring.map(([lng,lat]:number[])=>[lng,lat]));
+      } else if (geom.type === 'Polygon') {
+        for (const ring of geom.coordinates) paths.push(ring.map(([lng,lat]:number[])=>[lng,lat]));
+      } else continue;
+
+      const [cx, cy] = centroidOfRings(paths[0] || []);
+      provincePropsByGb.set(gb, { name, adcode, center: [cx, cy] });
+
+      const poly = new AMapRef.Polygon({
+        path: paths, zIndex: 40,
+        strokeColor: layers.showProvinceBorders ? '#e60000' : 'transparent',
+        strokeWeight: layers.showProvinceBorders ? 1 : 0,
+        fillOpacity: layers.showProvinceFill ? 0.8 : 0,
+        fillColor: computeFill(adcode)
+      });
+      poly.setExtData({ name, adcode, center:[cx,cy] });
+      poly.setMap(map);
+
+      poly.on('mouseover', (e:any)=>{
+        activeProvinceAdcode.value = adcode;
+        showHover(e.lnglat, name, adcode);
+        poly.setOptions({ fillColor: computeFill(adcode, true) });
+      });
+      poly.on('mouseout', ()=>{
+        activeProvinceAdcode.value = null;
+        hoverInfo?.close?.();
+        poly.setOptions({ fillColor: computeFill(adcode, false) });
+      });
+      provincePolygons.push(poly);
+    }
+  } catch (err) {
+    console.error('Province fallback rendering failed:', err);
+  }
+}
+
+function centroidOfRings(ring: [number,number][]): [number,number] {
+  if (!ring?.length) return [105,35];
+  let x=0,y=0,a=0;
+  for (let i=0;i<ring.length;i++){
+    const [x1,y1]=ring[i], [x2,y2]=ring[(i+1)%ring.length];
+    const cross = x1*y2 - x2*y1;
+    a += cross; x += (x1+x2)*cross; y += (y1+y2)*cross;
+  }
+  a = a || 1;
+  return [x/(3*a), y/(3*a)];
 }
 
 /* ---------------------------- Route & samples ----------------------------- */
@@ -364,33 +428,24 @@ function renderRoute(path: [number,number][], samplesForDebug: [number,number][]
   routePolyline = new AMapRef.Polyline({ path, strokeColor:'#007aff', strokeWeight:5, strokeOpacity:.9, zIndex:60 })
   if (layers.showRoute) routePolyline.setMap(map)
 
-  // create / update samples immediately按当前开关
   sampleDots.forEach(d => d.setMap(null)); sampleDots = []
   if (layers.showSamplePoints) {
-    sampleDots = samplesForDebug.map(p =>
-      new AMapRef.CircleMarker({ center:p, radius:3, strokeWeight:0, fillColor:'#111', fillOpacity:.8, zIndex:65 })
-    )
+    sampleDots = samplesForDebug.map(pt => new AMapRef.CircleMarker({
+      center: pt, radius: 3, fillOpacity: .9, fillColor:'#ff4081', strokeOpacity:0, zIndex: 80
+    }))
     sampleDots.forEach(d => d.setMap(map))
   }
-  lastSamples = samplesForDebug.slice()
 }
-watch(() => layers.showRoute, () => { if (routePolyline) routePolyline.setMap(layers.showRoute ? map : null) })
-watch(() => layers.showSamplePoints, () => {
-  // 如果之前没生成（用户事后开启开关），现在立刻生成
-  sampleDots.forEach(d => d.setMap(null)); sampleDots = []
-  if (layers.showSamplePoints && lastSamples.length) {
-    sampleDots = lastSamples.map(p =>
-      new AMapRef.CircleMarker({ center:p, radius:3, strokeWeight:0, fillColor:'#111', fillOpacity:.8, zIndex:65 })
-    )
-    sampleDots.forEach(d => d.setMap(map))
-  }
-})
-watch(() => [layers.showProvinceFill, layers.showProvinceBorders], () => recolorProvinceLayer())
+function clearRoute() {
+  if (routePolyline) routePolyline.setMap(null)
+  sampleDots.forEach(d => d.setMap(null))
+  routePolyline = null; sampleDots = []
+}
 
-/* ------------------------------ Cities layer ------------------------------ */
-async function getCityCenterByAdcode(adcode: string): Promise<[number,number] | null> {
+/* --------------------------- Cities along route --------------------------- */
+async function getCityCenterByAdcode(adcode:string): Promise<[number,number]|null> {
   try {
-    const res = await dsSearchWithTimeout({ level:'city', extensions:'base' }, adcode, 8000)
+    const res:any = await dsSearchWithTimeout({ level:'city', extensions:'base' }, adcode, 8000)
     const d = res?.districtList?.[0]
     return d?.center ? [d.center.lng, d.center.lat] : null
   } catch { return null }
@@ -406,7 +461,7 @@ async function renderCities(cities: { name:string; adcode:string }[]) {
   const usable = enriched.filter(c => c.center) as Array<{name:string;adcode:string;center:[number,number]}>
 
   cityMarkers = usable.map(c => new AMapRef.Marker({ position: c.center, title: c.name, extData: c, zIndex:70 }))
-  if (cityMarkers.length > 80 && AMapRef.MarkerClusterer) {
+  if (usable.length > 12 && AMapRef?.MarkerClusterer) {
     // @ts-ignore
     cityCluster = new AMapRef.MarkerClusterer(map, cityMarkers)
   } else {
@@ -414,14 +469,46 @@ async function renderCities(cities: { name:string; adcode:string }[]) {
   }
 
   cityMarkers.forEach(m => m.on('click', async () => {
-    const c = m.getExtData()
-    const [lng, lat] = c.center
-    const w = await fetchWeatherForCoord(lat, lng)
-    const info = new AMapRef.InfoWindow({
-      content: `<div style="font-size:12px"><b>${c.name}</b><br>温度: ${w.tempC ?? '-'}°C<br>风速: ${w.windKph ?? '-'} km/h</div>`,
-      offset: new AMapRef.Pixel(0, -20)
-    })
-    info.open(map, c.center)
+    const c = m.getExtData();
+    const [lng, lat] = c.center;
+    const now = await fetchWeatherForCoord(lat, lng);
+    const h = await fetchHourly24h(lat, lng);
+
+    const html = `<div id="city-popup" style="width:360px;padding:6px 6px 0 6px;">
+        <div style="font-size:12px;margin-bottom:6px;">
+          <b>${c.name}</b> ｜ 现在：${now.tempC ?? '-'}°C，风 ${now.windKph ?? '-'} km/h
+        </div>
+        <div id="chart24h" style="width:348px;height:220px;"></div>
+      </div>`;
+    const info = new AMapRef.InfoWindow({ content: html, offset: new AMapRef.Pixel(0, -20) });
+    info.open(map, c.center);
+
+    // 动态加载 ECharts，避免阻断底图
+    setTimeout(async () => {
+      const el = document.getElementById('chart24h');
+      if (!el) return;
+      try {
+        const echarts: any = await import('echarts');
+        const chart = echarts.init(el);
+        chart.setOption({
+          grid: { left: 40, right: 30, top: 25, bottom: 35 },
+          tooltip: { trigger: 'axis' },
+          legend: { data: ['温度(°C)','风速(km/h)','降水(mm/h)'] },
+          xAxis: { type: 'category', data: h.times.map(t => t.slice(11,16)) },
+          yAxis: [
+            { type: 'value', name: '°C' },
+            { type: 'value', name: 'km/h' },
+          ],
+          series: [
+            { name: '温度(°C)', type: 'line', smooth: true, yAxisIndex: 0, data: h.temperature },
+            { name: '风速(km/h)', type: 'line', smooth: true, yAxisIndex: 1, data: h.wind },
+            { name: '降水(mm/h)', type: 'bar', yAxisIndex: 1, data: h.precipitation, barWidth: 6, opacity: 0.6 }
+          ]
+        });
+      } catch (e) {
+        console.warn('[ECharts] 动态加载失败，24h 曲线未渲染：', e)
+      }
+    }, 50);
   }))
 }
 watch(() => layers.showCities, () => {
@@ -434,7 +521,6 @@ watch(() => layers.showCities, () => {
 })
 
 /* -------------------------- Weather & choropleth -------------------------- */
-// hex -> rgba，避免某些环境下 hex 填充不生效
 function toRGBA(c: string, a = 0.7) {
   if (!c) return 'rgba(0,0,0,0.05)'
   if (c.startsWith('rgba') || c.startsWith('rgb')) return c
@@ -455,30 +541,67 @@ async function updateWeatherColors(metric: 'temp'|'wind'|'precip') {
     rows.push({ adcode: p.adcode, name: p.name, center: [lng, lat], value, unit: metric === 'temp' ? '°C' : (metric === 'wind' ? 'km/h' : 'mm/h') })
   }
 
-  console.groupCollapsed('%cWeather · Provinces (center sample)', 'color:#0b7; font-weight:600')
-  console.table(rows)
-  console.groupEnd()
-
   const values = rows.map(r => r.value)
   const vmin = Math.min(...values), vmax = Math.max(...values)
   legendMin.value = vmin.toFixed(1); legendMax.value = vmax.toFixed(1)
   const scale = makeLinearScale(vmin, vmax, legendColors)
 
-  colorByAdcode = {}
-  rows.forEach(r => { colorByAdcode[r.adcode] = toRGBA(scale(r.value), 0.72) }) // 用 rgba 确保可见
+  colorByAdcode = {}; colorValuesByAdcode = {}; currentUnit = rows[0]?.unit ?? '';
+  rows.forEach(r => { colorByAdcode[r.adcode] = toRGBA(scale(r.value), 0.72); colorValuesByAdcode[r.adcode] = r.value })
+
   recolorProvinceLayer()
 }
 
+function computeFill(ad: string, hover = false): string {
+  if (!layers.showProvinceFill) return 'transparent';
+  if (ui.value.showChoropleth && colorByAdcode[ad]) return colorByAdcode[ad];
+  if (hover && activeProvinceAdcode.value === ad) return 'rgba(255,160,0,0.35)';
+  if (activeProvinceAdcode.value === ad) return 'rgba(255,160,0,0.35)';
+  return 'rgba(0,0,0,0.05)';
+}
+function showHover(lnglat: any, name?: string, adcode?: string) {
+  if (!hoverInfo) return;
+  const valueTxt = adcode && colorValuesByAdcode[adcode] != null
+    ? `：${colorValuesByAdcode[adcode].toFixed(1)} ${currentUnit}`
+    : '';
+  hoverInfo.setContent(`<div style="font-size:12px;padding:4px 6px;"><b>${name ?? ''}</b>${valueTxt}</div>`);
+  hoverInfo.open(map, lnglat);
+}
+
+function recolorProvinceLayer() {
+  if (provinceLayer) {
+    provinceLayer.setStyles({
+      'fill': (props:any) => computeFill(props.adcode),
+      'province-stroke': layers.showProvinceBorders ? '#e60000' : 'transparent',
+      'city-stroke': 'transparent',
+      'county-stroke': 'transparent'
+    });
+    // 强制刷新一次，避免偶发样式不同步
+    provinceLayer.setMap(null); provinceLayer.setMap(map);
+    return;
+  }
+  // GeoJSON fallback
+  provincePolygons.forEach(poly => {
+    const ad = poly.getExtData()?.adcode;
+    poly.setOptions({
+      strokeColor: layers.showProvinceBorders ? '#e60000' : 'transparent',
+      strokeWeight: layers.showProvinceBorders ? 1 : 0,
+      fillOpacity: layers.showProvinceFill ? 0.8 : 0,
+      fillColor: computeFill(ad)
+    });
+  });
+}
+
 /* -------------------------------- Routing --------------------------------- */
-function clearRoute() {
-  if (routePolyline) routePolyline.setMap(null)
-  routePolyline = null
-  sampleDots.forEach(d => d.setMap(null)); sampleDots = []
+function clearAllDynamic() {
+  clearRoute()
+  cityMarkers.forEach(m => m.setMap(null)); cityMarkers = []
+  if (cityCluster) cityCluster.setMap(null); cityCluster = null
 }
 
 async function doPlan(p: { from: string; to: string; stepKm: number }) {
   if (!map) return
-  clearRoute()
+  clearAllDynamic()
 
   const from = parseCoord(p.from), to = parseCoord(p.to)
   if (!from || !to) return alert("起终点请用 'lng,lat' 格式")
@@ -491,32 +614,17 @@ async function doPlan(p: { from: string; to: string; stepKm: number }) {
   renderRoute(path, samplesForDebug)
   map.setFitView([routePolyline], true, [60,60,60,60])
 
-  console.groupCollapsed('%cRoute · Driving result', 'color:#07f; font-weight:600')
-  const totalKm = (path.reduce((s,_,i)=> i? s + (AMapRef?.GeometryUtil ? AMapRef.GeometryUtil.distance(path[i-1],path[i]) : 0) : 0, 0) / 1000).toFixed(1)
-  console.log('Points:', path.length, 'Distance(km, approx):', totalKm)
-  console.log('Path preview (first 10):', path.slice(0,10))
-  console.groupEnd()
-
   // Provinces (accurate)
   try {
-    console.time('ProvincesAlongRoute')
     passedProvinces = await provincesAlongRouteAccurate(path)
-    console.timeEnd('ProvincesAlongRoute')
-    console.groupCollapsed('%cProvinces · Along the route', 'color:#a40; font-weight:600')
-    console.table(passedProvinces.map(pp => ({ name: pp.name, adcode: pp.adcode, center: pp.center })))
-    console.groupEnd()
+    ensureProvinceLayer()
   } catch (err) {
     console.error('Provinces · compute failed:', err)
   }
 
   // Cities (fast)
   try {
-    console.time('CitiesAlongRoute')
     const cities: CityInfo[] = await citiesAlongRouteFast(path)
-    console.timeEnd('CitiesAlongRoute')
-    console.groupCollapsed('%cCities · Along the route', 'color:#a0a; font-weight:600')
-    console.table(cities.map(c => ({ name: c.name, adcode: c.adcode })))
-    console.groupEnd()
     lastCities = cities
     renderCities(cities)
   } catch (err) {
@@ -525,10 +633,8 @@ async function doPlan(p: { from: string; to: string; stepKm: number }) {
 
   // Weather → color provinces
   try {
-    console.time('WeatherColors')
     if (ui.value.showChoropleth) await updateWeatherColors(ui.value.metric as any)
     else { colorByAdcode = {}; recolorProvinceLayer() }
-    console.timeEnd('WeatherColors')
   } catch (err) {
     console.error('Weather · update failed:', err)
   }
@@ -544,7 +650,7 @@ onMounted(async () => {
   map = new AMapRef.Map(mapRef.value, { zoom: 5, center: [105, 35] })
 
   assertAmapPlugins()
-  geocoder = new AMapRef.Geocoder({ extensions: 'all' })
+  geocoder = AMapRef?.Geocoder ? new AMapRef.Geocoder({ extensions: 'all' }) : null
   ensureProvinceLayer()
 })
 
@@ -557,6 +663,16 @@ watch(() => ui.value, async (v) => {
 }, { deep: true })
 
 watch(() => props.planTrigger, (v) => { if (v) doPlan(v) })
+watch(() => [layers.showProvinceFill, layers.showProvinceBorders], () => recolorProvinceLayer())
+watch(() => layers.showSamplePoints, () => {
+  sampleDots.forEach(d => d.setMap(null)); sampleDots = []
+  if (layers.showSamplePoints && lastSamples.length) {
+    sampleDots = lastSamples.map(p =>
+      new AMapRef.CircleMarker({ center:p, radius:3, strokeWeight:0, fillColor:'#111', fillOpacity:.8, zIndex:65 })
+    )
+    sampleDots.forEach(d => d.setMap(map))
+  }
+})
 </script>
 
 <style scoped>
