@@ -22,7 +22,7 @@ export async function fetchDisasterWarning(lon: number, lat: number): Promise<Di
     return [];
   }
   
-  const url = `https://devapi.qweather.com/v7/warning/now?location=${lon.toFixed(2)},${lat.toFixed(2)}&key=${QWEATHER_KEY}`;
+  const url = `https://n84nmt9v5f.re.qweatherapi.com/v7/warning/now?location=${lon.toFixed(2)},${lat.toFixed(2)}&key=${QWEATHER_KEY}`;
 
   try {
     const r = await fetch(url);

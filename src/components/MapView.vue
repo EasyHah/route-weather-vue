@@ -31,7 +31,6 @@ import Controls from './Controls.vue'
 import Legend from './Legend.vue'
 import { loadAmap, geocode, planDriving } from '@/services/amap'
 import { fetchProvinceList, type ProvinceInfo } from '@/services/district'
-// [修改] 引入和风天气的服务
 import { fetchWeatherByLocation, fetchHourly24h, type QWeatherInfo } from '@/services/weather'
 import { fetchDisasterWarning, type DisasterWarning } from '@/services/disaster'
 import { makeLinearScale } from '@/services/choropleth'
@@ -39,7 +38,6 @@ import ProvinceInfoPopup from './ProvinceInfoPopup.vue'
 
 const props = defineProps<{ planTrigger: { from: string; to: string; stepKm: number } | null }>()
 
-// ... (Map refs, Layer toggles, Admin rendering, UI/legend 等部分保持不变) ...
 const mapRef = ref<HTMLDivElement | null>(null)
 let map: any = null
 let AMapRef: any = null
@@ -55,7 +53,7 @@ const layers = reactive({
 
 let provinceLayers: any[] = []
 const activeProvinceAdcode = ref<string | null>(null)
-let hoverInfo: any = null
+let provinceInfoWindow: any | null = null;
 
 const ui = ref({ metric: 'temp', showChoropleth: true })
 const legendColors = ['#2c7bb6','#abd9e9','#ffffbf','#fdae61','#d7191c']
@@ -68,10 +66,8 @@ let colorByAdcode: Record<string, string> = {}
 let colorValuesByAdcode: Record<string, number> = {}
 let currentUnit = ''
 
-// [修改] 缓存的数据结构类型变更为 QWeatherInfo
 let provinceDataCache = new Map<string, { weather: QWeatherInfo | null, warnings: DisasterWarning[] }>();
 
-// ... (CityInfo, geocodeCache, Route/sample layers 等部分保持不变) ...
 type CityInfo = { name: string; adcode: string; center?: [number, number] }
 const geocodeCache = new Map<string, { province: string; provinceAdcode: string; city: string; cityAdcode: string }>()
 
@@ -82,7 +78,9 @@ let cityMarkers: any[] = []
 let cityCluster: any | null = null
 let lastCities: { name:string; adcode:string }[] = []
 
-// ... (Helpers, DS/Geocoder helpers, Provinces & Cities along route 等部分保持不变) ...
+// [NEW] Array to hold the clickable province center markers
+let provinceCenterMarkers: any[] = [];
+
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 function assertAmapPlugins() {
@@ -187,7 +185,7 @@ async function provincesAlongRoute(path: [number,number][]) {
       if (geoInfo?.provinceAdcode) {
         seenAdcodes.add(geoInfo.provinceAdcode)
       }
-      await sleep(10);
+      await sleep(250);
     } catch (err) {
       console.warn(`A geocoding sample failed for point ${p}:`, err);
     }
@@ -209,16 +207,17 @@ async function citiesAlongRoute(path:[number,number][]) {
         seenAdcodes.add(g.cityAdcode)
         out.push({ name: g.city, adcode: g.adcode })
       }
-       await sleep(10);
+       await sleep(250);
     } catch {}
   }
   return out
 }
-// ... (DistrictLayer Rendering, Route & other layers 等部分保持不变) ...
+
 function clearProvinceLayers() {
     provinceLayers.forEach(layer => layer.setMap(null));
     provinceLayers = [];
 }
+
 function renderPassedProvinceLayers() {
     clearProvinceLayers();
     if (!AMapRef?.DistrictLayer?.Province || !passedProvinces.length) return;
@@ -237,25 +236,40 @@ function renderPassedProvinceLayers() {
         });
         layer.setMap(map);
         
-        layer.on('mouseover', (e: any) => {
-            const adcode = e.feature?.properties?.adcode;
-            if (adcode) {
-                activeProvinceAdcode.value = adcode;
-                showHover(e.lnglat, adcode);
-            }
-        });
-        layer.on('mouseout', () => {
-            activeProvinceAdcode.value = null;
-            if (hoverInfo) {
-                hoverInfo.getExtData().app.unmount();
-                hoverInfo.setMap(null);
-                hoverInfo = null;
-            }
-        });
-
+        // [MODIFIED] Removed mouseover and mouseout events from province layer
         provinceLayers.push(layer);
     });
 }
+
+// [NEW] Function to render clickable markers at the center of each province
+function renderProvinceCenters() {
+  provinceCenterMarkers.forEach(m => m.setMap(null));
+  provinceCenterMarkers = [];
+
+  if (!passedProvinces.length) return;
+
+  provinceCenterMarkers = passedProvinces.map(prov => {
+    const marker = new AMapRef.Marker({
+      position: prov.center,
+      zIndex: 90, // Ensure markers are on top
+      extData: {
+        adcode: prov.adcode
+      }
+    });
+
+    // Add click event listener to each marker
+    marker.on('click', (e: any) => {
+      showProvinceInfoWindow(e.target.getPosition(), e.target.getExtData().adcode);
+    });
+
+    return marker;
+  });
+  
+  // Add markers to the map
+  map.add(provinceCenterMarkers);
+}
+
+
 function renderRoute(path: [number,number][], samplesForDebug: [number,number][]) {
   if (routePolyline) routePolyline.setMap(null)
   routePolyline = new AMapRef.Polyline({ path, strokeColor:'#007aff', strokeWeight:5, strokeOpacity:.9, zIndex:60 })
@@ -285,7 +299,7 @@ async function getCityCenterByAdcode(adcode:string): Promise<[number,number]|nul
         return null;
     }
 }
-// [修改] renderCities 函数，使用和风天气逐小时API
+
 async function renderCities(cities: { name:string; adcode:string }[]) {
   cityMarkers.forEach(m => m.setMap(null)); cityMarkers = []
   if (cityCluster) { cityCluster.setMap(null); cityCluster = null }
@@ -354,7 +368,6 @@ async function renderCities(cities: { name:string; adcode:string }[]) {
   }))
 }
 
-// ... (toRGBA 保持不变) ...
 function toRGBA(c: string, a = 0.7) {
   if (!c) return 'rgba(0,0,0,0.05)'
   if (c.startsWith('rgba') || c.startsWith('rgb')) return c
@@ -362,7 +375,7 @@ function toRGBA(c: string, a = 0.7) {
   const r = parseInt(m.slice(0,2),16), g = parseInt(m.slice(2,4),16), b = parseInt(m.slice(4,6),16)
   return `rgba(${r},${g},${b},${a})`
 }
-// [修改] updateWeatherColors 函数，使用和风天气的数据
+
 async function updateWeatherColors(metric: 'temp'|'dayTemp'|'nightTemp'|'wind') {
   if (!passedProvinces.length) return;
   
@@ -389,7 +402,7 @@ async function updateWeatherColors(metric: 'temp'|'dayTemp'|'nightTemp'|'wind') 
         unit = '°C';
         break;
       case 'wind':
-        value = parseInt(data.weather.now.windScale.split('-')[0]); // 取风力范围的第一个值
+        value = parseInt(data.weather.now.windScale.split('-')[0]);
         unit = '级';
         break;
     }
@@ -416,7 +429,6 @@ async function updateWeatherColors(metric: 'temp'|'dayTemp'|'nightTemp'|'wind') 
   });
 }
 
-// ... (computeFill, showHover, clearAllDynamic 保持不变) ...
 function computeFill(adcode: string, hover = false): string {
   const data = provinceDataCache.get(adcode);
   if (data && data.warnings.length > 0) {
@@ -428,13 +440,7 @@ function computeFill(adcode: string, hover = false): string {
   return 'rgba(0,0,0,0.05)';
 }
 
-function showHover(lnglat: AMap.LngLat, adcode: string) {
-  if (hoverInfo) {
-      hoverInfo.getExtData().app.unmount();
-      hoverInfo.setMap(null);
-      hoverInfo = null;
-  }
-
+function showProvinceInfoWindow(lnglat: any, adcode: string) {
   const data = provinceDataCache.get(adcode);
   if (!data || !data.weather) return;
 
@@ -446,28 +452,35 @@ function showHover(lnglat: AMap.LngLat, adcode: string) {
       })
   });
   app.mount(container);
-
-  hoverInfo = new AMapRef.Marker({
-      position: lnglat,
+  
+  if (!provinceInfoWindow) {
+    provinceInfoWindow = new AMapRef.InfoWindow({
+      isCustom: true,
       content: container,
-      offset: new AMapRef.Pixel(0, -20),
+      offset: new AMapRef.Pixel(0, -15),
       anchor: 'bottom-center'
-  });
-  hoverInfo.setExtData({ app });
-  hoverInfo.setMap(map);
+    });
+  } else {
+    provinceInfoWindow.setContent(container);
+  }
+
+  provinceInfoWindow.open(map, lnglat);
 }
 
 function clearAllDynamic() {
   if (routePolyline) { routePolyline.setMap(null); routePolyline = null; }
   sampleDots.forEach(d => d.setMap(null)); sampleDots = [];
   cityMarkers.forEach(m => m.setMap(null)); cityMarkers = [];
+  // [MODIFIED] Clear the province center markers as well
+  provinceCenterMarkers.forEach(m => m.setMap(null)); provinceCenterMarkers = [];
   if (cityCluster) { cityCluster.setMap(null); cityCluster = null; }
+  if (provinceInfoWindow) { provinceInfoWindow.close(); }
   passedProvinces = [];
   colorByAdcode = {};
   colorValuesByAdcode = {};
   clearProvinceLayers();
 }
-// [修改] doPlan 函数，调用和风天气API
+
 async function doPlan(p: { from: string; to: string; stepKm: number }) {
   if (!map) return;
   clearAllDynamic();
@@ -497,21 +510,23 @@ async function doPlan(p: { from: string; to: string; stepKm: number }) {
     lastCities = citiesResult;
     renderCities(citiesResult);
     
-    // 使用和风天气API获取数据
-    await Promise.all(passedProvinces.map(async (prov) => {
+    for (const prov of passedProvinces) {
       const [lon, lat] = prov.center;
       const [weather, warnings] = await Promise.all([
         fetchWeatherByLocation(lon, lat),
         fetchDisasterWarning(lon, lat)
       ]);
       provinceDataCache.set(prov.adcode, { weather, warnings });
-    }));
+      await sleep(300); 
+    }
 
     if (passedProvinces.length > 0 && ui.value.showChoropleth) {
       await updateWeatherColors(ui.value.metric as any)
     }
 
     renderPassedProvinceLayers();
+    // [MODIFIED] Call the new function to render markers
+    renderProvinceCenters();
 
   } catch (err) {
     console.error("Driving plan failed:", err);
@@ -519,7 +534,6 @@ async function doPlan(p: { from: string; to: string; stepKm: number }) {
   }
 }
 
-// ... (Init 和 Watchers 部分保持不变) ...
 onMounted(async () => {
   await nextTick()
   try {
@@ -598,4 +612,21 @@ watch(() => layers.showSamplePoints, () => {
   padding: 8px 10px; box-shadow: 0 6px 24px rgba(0,0,0,.08); font-size: 12px;
 }
 .layer-panel label { display: block; line-height: 20px; white-space: nowrap; }
+
+.map-wrap :deep(.amap-info-content) {
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
+  border: none;
+}
+.map-wrap :deep(.amap-info-close) {
+  display: none;
+}
+.map-wrap :deep(.amap-info-outer, .amap-info-contentContainer) {
+    background: transparent;
+}
+.map-wrap :deep(.amap-info-sharp) {
+    display: none;
+}
+
 </style>
