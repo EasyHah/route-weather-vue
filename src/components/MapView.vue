@@ -4,7 +4,6 @@
       <Controls v-model="ui" />
     </div>
 
-    <!-- Layer manager -->
     <div class="layer-panel">
       <label><input type="checkbox" v-model="layers.showRoute" /> 路线</label>
       <label><input type="checkbox" v-model="layers.showProvinceBorders" /> 省界</label>
@@ -25,24 +24,27 @@
   </div>
 </template>
 
+
 <script setup lang="ts">
-import { onMounted, ref, watch, nextTick, reactive } from 'vue'
+import { onMounted, ref, watch, nextTick, reactive, createApp, h } from 'vue'
 import Controls from './Controls.vue'
 import Legend from './Legend.vue'
-import { loadAmap, geocode, planDriving } from '@/services/amap' 
+import { loadAmap, geocode, planDriving } from '@/services/amap'
 import { fetchProvinceList, type ProvinceInfo } from '@/services/district'
-import { fetchWeatherForCoord, fetchHourly24h } from '@/services/weather'
+// [修改] 引入和风天气的服务
+import { fetchWeatherByLocation, fetchHourly24h, type QWeatherInfo } from '@/services/weather'
+import { fetchDisasterWarning, type DisasterWarning } from '@/services/disaster'
 import { makeLinearScale } from '@/services/choropleth'
+import ProvinceInfoPopup from './ProvinceInfoPopup.vue'
 
 const props = defineProps<{ planTrigger: { from: string; to: string; stepKm: number } | null }>()
 
-/* ------------------------------- Map refs -------------------------------- */
+// ... (Map refs, Layer toggles, Admin rendering, UI/legend 等部分保持不变) ...
 const mapRef = ref<HTMLDivElement | null>(null)
 let map: any = null
 let AMapRef: any = null
 let geocoder: any = null
 
-/* ------------------------------ Layer toggles ----------------------------- */
 const layers = reactive({
   showRoute: true,
   showProvinceBorders: true,
@@ -51,29 +53,28 @@ const layers = reactive({
   showSamplePoints: false,
 })
 
-/* --------------------------- Admin rendering ------------------------------ */
-// [修正] provinceLayer 现在是一个数组，用来存放多个省份图层
 let provinceLayers: any[] = []
 const activeProvinceAdcode = ref<string | null>(null)
 let hoverInfo: any = null
 
-/* ------------------------------ UI / legend ------------------------------ */
 const ui = ref({ metric: 'temp', showChoropleth: true })
 const legendColors = ['#2c7bb6','#abd9e9','#ffffbf','#fdae61','#d7191c']
 const legendTitle = '省级天气可视化'
 const legendMin = ref('低'); const legendMax = ref('高')
 
-/* ---------------------------- Data / caches ------------------------------ */
 let allProvinces: ProvinceInfo[] = []
 let passedProvinces: ProvinceInfo[] = []
 let colorByAdcode: Record<string, string> = {}
 let colorValuesByAdcode: Record<string, number> = {}
 let currentUnit = ''
 
+// [修改] 缓存的数据结构类型变更为 QWeatherInfo
+let provinceDataCache = new Map<string, { weather: QWeatherInfo | null, warnings: DisasterWarning[] }>();
+
+// ... (CityInfo, geocodeCache, Route/sample layers 等部分保持不变) ...
 type CityInfo = { name: string; adcode: string; center?: [number, number] }
 const geocodeCache = new Map<string, { province: string; provinceAdcode: string; city: string; cityAdcode: string }>()
 
-/* --------------------- Route / sample / cities layers --------------------- */
 let routePolyline: any | null = null
 let sampleDots: any[] = []
 let lastSamples: [number,number][] = []
@@ -81,8 +82,7 @@ let cityMarkers: any[] = []
 let cityCluster: any | null = null
 let lastCities: { name:string; adcode:string }[] = []
 
-
-/* -------------------------------- Helpers -------------------------------- */
+// ... (Helpers, DS/Geocoder helpers, Provinces & Cities along route 等部分保持不变) ...
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 function assertAmapPlugins() {
@@ -140,8 +140,6 @@ function samplePolyline(path: [number,number][], stepKm = 10): [number,number][]
   return pts;
 }
 
-
-/* --------------------------- DS / Geocoder helpers ------------------------ */
 function ensureGeocoder() { if (!geocoder && AMapRef?.Geocoder) geocoder = new AMapRef.Geocoder({ extensions: 'all' }) }
 function keyForLngLat(lnglat:[number,number]) { return `${lnglat[0].toFixed(4)},${lnglat[1].toFixed(4)}` }
 
@@ -171,7 +169,6 @@ async function reverseGeocodeProvinceCity(lnglat:[number,number]): Promise<{ pro
   })
 }
 
-/* ------------------------ Provinces & Cities along route (OPTIMIZED) ------------------------ */
 async function ensureProvinceList() {
   if (allProvinces.length) return
   allProvinces = await fetchProvinceList(AMapRef)
@@ -217,22 +214,14 @@ async function citiesAlongRoute(path:[number,number][]) {
   }
   return out
 }
-
-/* ---------------------- DistrictLayer Rendering (REFACTORED) ------------------ */
-
+// ... (DistrictLayer Rendering, Route & other layers 等部分保持不变) ...
 function clearProvinceLayers() {
     provinceLayers.forEach(layer => layer.setMap(null));
     provinceLayers = [];
 }
-
-/** [重构] 为每个经过的省份创建独立的图层 */
 function renderPassedProvinceLayers() {
     clearProvinceLayers();
     if (!AMapRef?.DistrictLayer?.Province || !passedProvinces.length) return;
-
-    if (!hoverInfo && AMapRef?.InfoWindow) {
-        hoverInfo = new AMapRef.InfoWindow({ isCustom: false, offset: new AMapRef.Pixel(0, -10), anchor: 'bottom-center' });
-    }
 
     passedProvinces.forEach(province => {
         const layer = new AMapRef.DistrictLayer.Province({
@@ -252,21 +241,21 @@ function renderPassedProvinceLayers() {
             const adcode = e.feature?.properties?.adcode;
             if (adcode) {
                 activeProvinceAdcode.value = adcode;
-                showHover(e.lnglat, e.feature?.properties?.name, adcode);
+                showHover(e.lnglat, adcode);
             }
         });
         layer.on('mouseout', () => {
             activeProvinceAdcode.value = null;
-            if (hoverInfo) hoverInfo.close();
+            if (hoverInfo) {
+                hoverInfo.getExtData().app.unmount();
+                hoverInfo.setMap(null);
+                hoverInfo = null;
+            }
         });
 
         provinceLayers.push(layer);
     });
 }
-
-
-/* ---------------------------- Route & other layers ----------------------------- */
-
 function renderRoute(path: [number,number][], samplesForDebug: [number,number][]) {
   if (routePolyline) routePolyline.setMap(null)
   routePolyline = new AMapRef.Polyline({ path, strokeColor:'#007aff', strokeWeight:5, strokeOpacity:.9, zIndex:60 })
@@ -296,7 +285,7 @@ async function getCityCenterByAdcode(adcode:string): Promise<[number,number]|nul
         return null;
     }
 }
-
+// [修改] renderCities 函数，使用和风天气逐小时API
 async function renderCities(cities: { name:string; adcode:string }[]) {
   cityMarkers.forEach(m => m.setMap(null)); cityMarkers = []
   if (cityCluster) { cityCluster.setMap(null); cityCluster = null }
@@ -317,12 +306,12 @@ async function renderCities(cities: { name:string; adcode:string }[]) {
   cityMarkers.forEach(m => m.on('click', async () => {
     const c = m.getExtData();
     const [lng, lat] = c.center;
-    const now = await fetchWeatherForCoord(lat, lng);
-    const h = await fetchHourly24h(lat, lng);
+    const nowWeather = await fetchWeatherByLocation(lng, lat);
+    const hourlyWeather = await fetchHourly24h(lng, lat);
 
     const html = `<div id="city-popup" style="width:360px;padding:6px 6px 0 6px;">
         <div style="font-size:12px;margin-bottom:6px;">
-          <b>${c.name}</b> ｜ 现在：${now.tempC ?? '-'}°C，风 ${now.windKph ?? '-'} km/h
+          <b>${c.name}</b> ｜ 现在：${nowWeather?.now.temp ?? '-'}°C，${nowWeather?.now.text ?? ''}
         </div>
         <div id="chart24h" style="width:348px;height:220px;"></div>
       </div>`;
@@ -331,24 +320,30 @@ async function renderCities(cities: { name:string; adcode:string }[]) {
 
     setTimeout(async () => {
       const el = document.getElementById('chart24h');
-      if (!el) return;
+      if (!el || !hourlyWeather.length) return;
+
+      const times = hourlyWeather.map(h => new Date(h.fxTime).getHours() + ':00');
+      const temps = hourlyWeather.map(h => parseFloat(h.temp));
+      const precips = hourlyWeather.map(h => parseFloat(h.precip));
+      const winds = hourlyWeather.map(h => parseInt(h.windScale.split('-')[0]));
+
       try {
         const echarts: any = await import('echarts');
         const chart = echarts.init(el);
         chart.setOption({
           grid: { left: 40, right: 30, top: 35, bottom: 35 },
           tooltip: { trigger: 'axis' },
-          legend: { data: ['温度(°C)','风速(km/h)','降水(mm)'], top: 0, left: 'center', itemGap: 10 },
-          xAxis: { type: 'category', data: h.times.map(t => t.slice(11,16)) },
+          legend: { data: ['温度(°C)','风力(级)','降水(mm)'], top: 0, left: 'center', itemGap: 10 },
+          xAxis: { type: 'category', data: times },
           yAxis: [
-            { type: 'value', name: '°C', min: Math.floor(Math.min(...h.temperature) - 2), max: Math.ceil(Math.max(...h.temperature) + 2) },
-            { type: 'value', name: 'km/h', splitLine: { show: false } },
+            { type: 'value', name: '°C', min: Math.floor(Math.min(...temps) - 2), max: Math.ceil(Math.max(...temps) + 2) },
+            { type: 'value', name: '级', splitLine: { show: false } },
             { type: 'value', name: 'mm', show: false, splitLine: { show: false } }
           ],
           series: [
-            { name: '温度(°C)', type: 'line', smooth: true, yAxisIndex: 0, data: h.temperature },
-            { name: '风速(km/h)', type: 'line', smooth: true, yAxisIndex: 1, data: h.wind },
-            { name: '降水(mm)', type: 'bar', yAxisIndex: 2, data: h.precipitation, barWidth: 6, itemStyle: { opacity: 0.6 } }
+            { name: '温度(°C)', type: 'line', smooth: true, yAxisIndex: 0, data: temps },
+            { name: '风力(级)', type: 'line', smooth: true, yAxisIndex: 1, data: winds },
+            { name: '降水(mm)', type: 'bar', yAxisIndex: 2, data: precips, barWidth: 6, itemStyle: { opacity: 0.6 } }
           ]
         });
       } catch (e) {
@@ -359,7 +354,7 @@ async function renderCities(cities: { name:string; adcode:string }[]) {
   }))
 }
 
-/* -------------------------- Weather & Choropleth -------------------------- */
+// ... (toRGBA 保持不变) ...
 function toRGBA(c: string, a = 0.7) {
   if (!c) return 'rgba(0,0,0,0.05)'
   if (c.startsWith('rgba') || c.startsWith('rgb')) return c
@@ -367,54 +362,101 @@ function toRGBA(c: string, a = 0.7) {
   const r = parseInt(m.slice(0,2),16), g = parseInt(m.slice(2,4),16), b = parseInt(m.slice(4,6),16)
   return `rgba(${r},${g},${b},${a})`
 }
-
-async function updateWeatherColors(metric: 'temp'|'wind'|'precip') {
-  if (!passedProvinces.length) return
-  const rows: Array<{ adcode: string, value:number, unit:string }> = []
-
-  const weatherPromises = passedProvinces.map(async p => {
-    const [lng, lat] = p.center
-    return fetchWeatherForCoord(lat, lng).then(w => ({ province: p, weather: w }));
-  });
+// [修改] updateWeatherColors 函数，使用和风天气的数据
+async function updateWeatherColors(metric: 'temp'|'dayTemp'|'nightTemp'|'wind') {
+  if (!passedProvinces.length) return;
   
-  const results = await Promise.all(weatherPromises);
+  const rows: Array<{ adcode: string, value: number, unit: string }> = [];
 
-  for (const { province, weather } of results) {
-    const value =
-      metric === 'temp'   ? (weather.tempC ?? 0) :
-      metric === 'wind'   ? (weather.windKph ?? 0) :
-                            (weather.precipNext6h ?? 0)
-    rows.push({ adcode: province.adcode, value, unit: metric === 'temp' ? '°C' : (metric === 'wind' ? 'km/h' : 'mm') })
+  for (const province of passedProvinces) {
+    const data = provinceDataCache.get(province.adcode);
+    if (!data || !data.weather) continue;
+
+    let value: number | null = null;
+    let unit = '';
+
+    switch (metric) {
+      case 'temp':
+        value = parseFloat(data.weather.now.temp);
+        unit = '°C';
+        break;
+      case 'dayTemp':
+        value = parseFloat(data.weather.daily[0]?.tempMax);
+        unit = '°C';
+        break;
+      case 'nightTemp':
+        value = parseFloat(data.weather.daily[0]?.tempMin);
+        unit = '°C';
+        break;
+      case 'wind':
+        value = parseInt(data.weather.now.windScale.split('-')[0]); // 取风力范围的第一个值
+        unit = '级';
+        break;
+    }
+
+    if (value !== null && !isNaN(value)) {
+      rows.push({ adcode: province.adcode, value, unit });
+    }
   }
-
+    
   const values = rows.map(r => r.value).filter(v => v !== null && !isNaN(v));
   if (!values.length) return;
 
-  const vmin = Math.min(...values), vmax = Math.max(...values)
-  legendMin.value = vmin.toFixed(1); legendMax.value = vmax.toFixed(1)
-  const scale = makeLinearScale(vmin, vmax, legendColors)
+  const vmin = Math.min(...values), vmax = Math.max(...values);
+  legendMin.value = vmin.toFixed(0); 
+  legendMax.value = vmax.toFixed(0);
+  const scale = makeLinearScale(vmin, vmax, legendColors);
 
-  colorByAdcode = {}; colorValuesByAdcode = {}; currentUnit = rows[0]?.unit ?? '';
-  rows.forEach(r => { colorByAdcode[r.adcode] = toRGBA(scale(r.value), 0.72); colorValuesByAdcode[r.adcode] = r.value })
+  colorByAdcode = {}; 
+  colorValuesByAdcode = {}; 
+  currentUnit = rows[0]?.unit ?? '';
+  rows.forEach(r => {
+    colorByAdcode[r.adcode] = toRGBA(scale(r.value), 0.72);
+    colorValuesByAdcode[r.adcode] = r.value;
+  });
 }
 
+// ... (computeFill, showHover, clearAllDynamic 保持不变) ...
 function computeFill(adcode: string, hover = false): string {
+  const data = provinceDataCache.get(adcode);
+  if (data && data.warnings.length > 0) {
+    return 'rgba(220, 38, 38, 0.4)';
+  }
   if (!layers.showProvinceFill) return 'transparent';
   if (hover && activeProvinceAdcode.value === adcode) return 'rgba(255,160,0,0.45)';
   if (ui.value.showChoropleth && colorByAdcode[adcode]) return colorByAdcode[adcode];
   return 'rgba(0,0,0,0.05)';
 }
 
-function showHover(lnglat: AMap.LngLat, name?: string, adcode?: string) {
-  if (!hoverInfo) return;
-  const valueTxt = adcode && colorValuesByAdcode[adcode] != null
-    ? `：${colorValuesByAdcode[adcode].toFixed(1)} ${currentUnit}`
-    : '';
-  hoverInfo.setContent(`<div style="font-size:12px;padding:4px 6px;"><b>${name ?? ''}</b>${valueTxt}</div>`);
-  hoverInfo.open(map, lnglat);
+function showHover(lnglat: AMap.LngLat, adcode: string) {
+  if (hoverInfo) {
+      hoverInfo.getExtData().app.unmount();
+      hoverInfo.setMap(null);
+      hoverInfo = null;
+  }
+
+  const data = provinceDataCache.get(adcode);
+  if (!data || !data.weather) return;
+
+  const container = document.createElement('div');
+  const app = createApp({
+      render: () => h(ProvinceInfoPopup, { 
+        weather: data.weather!, 
+        warnings: data.warnings 
+      })
+  });
+  app.mount(container);
+
+  hoverInfo = new AMapRef.Marker({
+      position: lnglat,
+      content: container,
+      offset: new AMapRef.Pixel(0, -20),
+      anchor: 'bottom-center'
+  });
+  hoverInfo.setExtData({ app });
+  hoverInfo.setMap(map);
 }
 
-/* -------------------------------- Routing --------------------------------- */
 function clearAllDynamic() {
   if (routePolyline) { routePolyline.setMap(null); routePolyline = null; }
   sampleDots.forEach(d => d.setMap(null)); sampleDots = [];
@@ -425,7 +467,7 @@ function clearAllDynamic() {
   colorValuesByAdcode = {};
   clearProvinceLayers();
 }
-
+// [修改] doPlan 函数，调用和风天气API
 async function doPlan(p: { from: string; to: string; stepKm: number }) {
   if (!map) return;
   clearAllDynamic();
@@ -455,11 +497,20 @@ async function doPlan(p: { from: string; to: string; stepKm: number }) {
     lastCities = citiesResult;
     renderCities(citiesResult);
     
+    // 使用和风天气API获取数据
+    await Promise.all(passedProvinces.map(async (prov) => {
+      const [lon, lat] = prov.center;
+      const [weather, warnings] = await Promise.all([
+        fetchWeatherByLocation(lon, lat),
+        fetchDisasterWarning(lon, lat)
+      ]);
+      provinceDataCache.set(prov.adcode, { weather, warnings });
+    }));
+
     if (passedProvinces.length > 0 && ui.value.showChoropleth) {
       await updateWeatherColors(ui.value.metric as any)
     }
 
-    // After weather data is ready, render the province layers
     renderPassedProvinceLayers();
 
   } catch (err) {
@@ -468,7 +519,7 @@ async function doPlan(p: { from: string; to: string; stepKm: number }) {
   }
 }
 
-/* --------------------------------- Init ----------------------------------- */
+// ... (Init 和 Watchers 部分保持不变) ...
 onMounted(async () => {
   await nextTick()
   try {
@@ -486,7 +537,6 @@ onMounted(async () => {
   ensureGeocoder()
 })
 
-/* ------------------------------- Watchers --------------------------------- */
 watch(() => props.planTrigger, (v) => { if (v) doPlan(v) }, { deep: true })
 
 watch(ui, async (v) => {
@@ -501,7 +551,6 @@ watch(ui, async (v) => {
 }, { deep: true })
 
 watch(() => [layers.showProvinceFill, layers.showProvinceBorders], () => {
-    // This now just needs to re-render the layers with current settings
     renderPassedProvinceLayers();
 })
 
